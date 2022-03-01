@@ -38,6 +38,8 @@ if ( ! class_exists( 'WP' ) ) {
 	die();
 }
 
+const PPP_TICKS_PER_NONCE_LIFE = 8;
+
 /**
  * The class which controls the plugin.
  *
@@ -591,8 +593,8 @@ class DS_Public_Post_Preview {
 	 */
 	private static function nonce_tick() {
 		$nonce_life = apply_filters( 'ppp_nonce_life', 2 * DAY_IN_SECONDS ); // 2 days.
-
-		return ceil( time() / ( $nonce_life / 2 ) );
+		$nonce_tick = ceil( time() / ( $nonce_life / PPP_TICKS_PER_NONCE_LIFE ) );
+		return $nonce_tick;
 	}
 
 	/**
@@ -606,9 +608,9 @@ class DS_Public_Post_Preview {
 	 * @return string The one use form token.
 	 */
 	private static function create_nonce( $action = -1 ) {
-		$i = self::nonce_tick();
-
-		return substr( wp_hash( $i . $action, 'nonce' ), -12, 10 );
+		$tick  = self::nonce_tick();
+		$nonce = substr( wp_hash( "$tick$action", 'nonce' ), -12, 10 );
+		return $nonce;
 	}
 
 	/**
@@ -623,16 +625,23 @@ class DS_Public_Post_Preview {
 	 * @return bool               Whether the nonce check passed or failed.
 	 */
 	private static function verify_nonce( $nonce, $action = -1 ) {
-		$i = self::nonce_tick();
 
-		// Nonce generated 0-12 hours ago.
-		if ( substr( wp_hash( $i . $action, 'nonce' ), -12, 10 ) === $nonce ) {
-			return 1;
-		}
+		$tick = self::nonce_tick();
 
-		// Nonce generated 12-24 hours ago.
-		if ( substr( wp_hash( ( $i - 1 ) . $action, 'nonce' ), -12, 10 ) === $nonce ) {
-			return 2;
+		$i = 0;
+		while ( $i <= PPP_TICKS_PER_NONCE_LIFE ) { // yes, ticks + 1
+			$expected = substr( wp_hash( "$tick$action", 'nonce' ), -12, 10 );
+			if ( hash_equals( $expected, $nonce ) ) {
+				// Nonce generated 0-15 hours ago.
+				if ( $i <= ( PPP_TICKS_PER_NONCE_LIFE / 2 ) ) {
+					return 1;
+				}
+
+				// Nonce generated 12-27 hours ago.
+				return 2;
+			}
+			$tick--;
+			$i++;
 		}
 
 		// Invalid nonce.
