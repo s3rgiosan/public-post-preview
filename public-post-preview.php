@@ -1,20 +1,20 @@
 <?php
 /**
  * Plugin Name: Public Post Preview
- * Version: 2.10.0
+ * Version: 3.0.1
  * Description: Allow anonymous users to preview a post before it is published.
  * Author: Dominik Schilling
  * Author URI: https://dominikschilling.de/
  * Plugin URI: https://github.com/ocean90/public-post-preview
  * Text Domain: public-post-preview
- * Requires at least: 5.0
- * Tested up to: 6.1
- * Requires PHP: 5.6
+ * Requires at least: 6.5
+ * Tested up to: 6.7
+ * Requires PHP: 8.0
  * License: GPLv2 or later
  *
  * Previously (2009-2011) maintained by Jonathan Dingman and Matt Martz.
  *
- *  Copyright (C) 2012-2022 Dominik Schilling
+ *  Copyright (C) 2012-2024 Dominik Schilling
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -53,6 +53,8 @@ class DS_Public_Post_Preview {
 	 * @since 1.0.0
 	 */
 	public static function init() {
+		add_action( 'init', array( __CLASS__, 'register_settings' ) );
+
 		add_action( 'transition_post_status', array( __CLASS__, 'unregister_public_preview_on_status_change' ), 20, 3 );
 		add_action( 'post_updated', array( __CLASS__, 'unregister_public_preview_on_edit' ), 20, 2 );
 
@@ -66,7 +68,66 @@ class DS_Public_Post_Preview {
 			add_action( 'wp_ajax_public-post-preview', array( __CLASS__, 'ajax_register_public_preview' ) );
 			add_action( 'admin_enqueue_scripts', array( __CLASS__, 'enqueue_script' ) );
 			add_filter( 'display_post_states', array( __CLASS__, 'display_preview_state' ), 20, 2 );
+			add_action( 'admin_init', array( __CLASS__, 'register_settings_ui' ) );
+
+			foreach( self::get_post_types() as $post_type ) {
+				add_filter( "views_edit-$post_type", array( __CLASS__, 'add_list_table_view' ) );
+			}
+			add_filter( 'pre_get_posts', array( __CLASS__, 'filter_post_list_for_public_preview' ) );
 		}
+	}
+
+	/**
+	 * Registers the settings used by the plugin.
+	 *
+	 * @since 3.0.0
+	 */
+	static function register_settings() {
+		register_setting(
+			'reading',
+			'public_post_preview_expiration_time',
+			array(
+				'show_in_rest' => true,
+				'type'         => 'integer',
+				'description'  => __( 'Default expiration time in seconds.', 'public-post-preview' ),
+				'default'      => 48,
+			)
+		);
+	}
+
+	/**
+	 * Registers the settings UI.
+	 *
+	 * @since 3.0.0
+	 */
+	static function register_settings_ui() {
+		if ( has_filter( 'ppp_nonce_life' ) ) {
+			return;
+		}
+
+		add_settings_section(
+			'public_post_preview',
+			__( 'Public Post Preview', 'public-post-preview' ),
+			'__return_false',
+			'reading'
+		);
+
+		add_settings_field(
+			'public_post_preview_expiration_time',
+			__( 'Expiration Time', 'public-post-preview' ),
+			static function() {
+				$value = get_option( 'public_post_preview_expiration_time' );
+				?>
+				<input type="number" id="public-post-preview-expiration-time" name="public_post_preview_expiration_time" value="<?php echo esc_attr( $value ); ?>" class="small-text" step="1" min="1" /> <?php _e( 'hours', 'public-post-preview' ); ?>
+				<p class="description"><?php _e( 'Default expiration time of a preview link in hours.', 'public-post-preview' ); ?></p>
+				<?php
+			},
+			'reading',
+			'public_post_preview',
+			array(
+				'label_for' => 'public-post-preview-expiration-time',
+			)
+		);
 	}
 
 	/**
@@ -143,10 +204,81 @@ class DS_Public_Post_Preview {
 	 */
 	public static function display_preview_state( $post_states, $post ) {
 		if ( in_array( (int) $post->ID, self::get_preview_post_ids(), true ) ) {
-			$post_states['ppp_enabled'] = __( 'Public Preview', 'public-post-preview' );
+			$post_states['ppp_enabled'] = sprintf(
+				' %s&nbsp;<a href="%s" target="_blank" aria-label="%s"><span class="dashicons dashicons-format-links" aria-hidden="true"></span></a>',
+				__( 'Public Preview', 'public-post-preview' ),
+				esc_url( self::get_preview_link( $post ) ),
+				esc_attr(
+					sprintf(
+						/* translators: %s: Post title */
+						__( 'Open public preview of &#8220;%s&#8221;', 'public-post-preview' ), _draft_or_post_title( $post )
+					)
+				)
+			);
 		}
 
 		return $post_states;
+	}
+
+	/**
+	 * Adds a "Public Preview" view to the post list table.
+	 *
+	 * @since 3.0.0
+	 *
+	 * @param string[] $views An array of available list table views.
+	 * @return string[] Filtered array of available list table views.
+	 */
+	public static function add_list_table_view( $views ) {
+		$count = count( self::get_preview_post_ids() );
+		if( ! $count ) {
+			return $views;
+		}
+
+		$screen    = get_current_screen();
+		$post_type = $screen->post_type;
+
+		// Get the count of posts for this post type with public preview status.
+		$query = new WP_Query(
+			array(
+				'post_type'      => $post_type,
+				'post__in'       => self::get_preview_post_ids(),
+				'post_status'    => 'draft',
+				'posts_per_page' => -1,
+				'no_found_rows'  => true,
+				'fields'         => 'ids',
+			)
+		);
+
+		if ( ! $query->post_count ) {
+			return $views;
+		}
+
+		$views['public_preview'] = sprintf(
+			'<a href="%s"%s>%s <span class="count">(%s)</span></a>',
+			esc_url( add_query_arg( array( 'post_type' => $post_type, 'public_preview' => 1 ), 'edit.php' ) ),
+			isset( $_GET['public_preview'] ) && '1' === $_GET['public_preview'] ? ' class="current"  aria-current="page"' : '',
+			__( 'Public Preview', 'public-post-preview' ),
+			number_format_i18n( $query->post_count )
+		);
+
+		return $views;
+	}
+
+	/**
+	 * Filters the post list to show only posts with public preview status.
+	 *
+	 * @since 3.0.0
+	 *
+	 * @param WP_Query $query The WP_Query instance.
+	 */
+	public static function filter_post_list_for_public_preview( $query ) {
+		if ( ! $query->is_admin || ! $query->is_main_query()) {
+			return;
+		}
+
+		if ( isset( $_GET['public_preview'] ) && '1' === $_GET['public_preview'] ) {
+			$query->set( 'post__in', self::get_preview_post_ids() );
+		}
 	}
 
 	/**
@@ -192,15 +324,10 @@ class DS_Public_Post_Preview {
 	 * @since 2.2.0
 	 */
 	public static function post_submitbox_misc_actions() {
-		$post_types = get_post_types(
-			array(
-				'public' => true,
-			)
-		);
-
 		$post = get_post();
 
-		if ( ! in_array( $post->post_type, $post_types, true ) ) {
+		// Ignore non-viewable post types.
+		if ( ! in_array( $post->post_type, self::get_post_types(), true ) ) {
 			return false;
 		}
 
@@ -220,6 +347,25 @@ class DS_Public_Post_Preview {
 		</div>
 		<?php
 
+	}
+
+	/**
+	 * Returns the viewable post types.
+	 *
+	 * @since 3.0.0
+	 *
+	 * @return string[] List with post types.
+	 */
+	private static function get_post_types() {
+		$viewable_post_types = array();
+		$post_types          = get_post_types( [], 'objects' );
+		foreach ( $post_types as $post_type ) {
+			if ( is_post_type_viewable( $post_type ) ) {
+				$viewable_post_types[] = $post_type->name;
+			}
+		}
+
+		return apply_filters( 'ppp_post_types', $viewable_post_types );
 	}
 
 	/**
@@ -509,12 +655,7 @@ class DS_Public_Post_Preview {
 				nocache_headers();
 				header( 'X-Robots-Tag: noindex' );
 			}
-			if ( function_exists( 'wp_robots_no_robots' ) ) { // WordPress 5.7+
-				add_filter( 'wp_robots', 'wp_robots_no_robots' );
-			} else {
-				add_action( 'wp_head', 'wp_no_robots' );
-			}
-
+			add_filter( 'wp_robots', 'wp_robots_no_robots' );
 			add_filter( 'posts_results', array( __CLASS__, 'set_post_to_publish' ), 10, 2 );
 		}
 	}
@@ -628,7 +769,8 @@ class DS_Public_Post_Preview {
 	 * @return int The time-dependent variable.
 	 */
 	private static function nonce_tick() {
-		$nonce_life = apply_filters( 'ppp_nonce_life', 2 * DAY_IN_SECONDS ); // 2 days.
+		$expiration = get_option( 'public_post_preview_expiration_time' ) ?: 48;
+		$nonce_life = apply_filters( 'ppp_nonce_life', $expiration * HOUR_IN_SECONDS );
 		$nonce_tick = ceil( time() / ( $nonce_life / PPP_TICKS_PER_NONCE_LIFE ) );
 		return $nonce_tick;
 	}
